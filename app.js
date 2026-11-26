@@ -1353,46 +1353,278 @@ function findPartnerBuilders(it, limit = 5) {
   return scored.slice(0, limit);
 }
 
-function renderBidSimHtml(it) {
+// ===== K-BID GRADE ENGINE (v22): G2B 기초금액·A값·순공사원가 · 복수예가 15개(1,365조합) · 적격심사 · 분포도 =====
+let QUAL_PROFILE = (() => {
+  try { return Object.assign({ credit: 'BBB', perfEok: 15, bonus: 1.5, cutoff: 95 }, JSON.parse(localStorage.getItem('bid_qual_profile_v1') || '{}') || {}); }
+  catch { return { credit: 'BBB', perfEok: 15, bonus: 1.5, cutoff: 95 }; }
+})();
+
+async function fetchBidBsisAmountLive(bidNtceNo) {
+  const rawKey = getEffectiveDataGoKey();
+  if (!rawKey || !bidNtceNo) return null;
+  const keyEnc = normalizeDataGoKey(rawKey);
+  const cleanNo = String(bidNtceNo).split('-')[0].trim();
+  const ops = [
+    'getBidPblancListInfoCnstwkBsisAmount02',
+    'getBidPblancListInfoServcBsisAmount02',
+    'getBidPblancListInfoThngBsisAmount02',
+  ];
+  const results = await Promise.all(ops.map(async op => {
+    try {
+      const r = await fetch(`https://apis.data.go.kr/1230000/ad/BidPublicInfoService02/${op}?serviceKey=${keyEnc}&inqryDiv=2&bidNtceNo=${encodeURIComponent(cleanNo)}&pageNo=1&numOfRows=5&type=json`);
+      if (!r.ok) return null;
+      const j = await r.json();
+      const raw = j?.response?.body?.items;
+      const arr = Array.isArray(raw) ? raw : (raw?.item ? (Array.isArray(raw.item) ? raw.item : [raw.item]) : []);
+      return arr[0] || null;
+    } catch { return null; }
+  }));
+  const x = results.find(Boolean);
+  if (!x) return null;
+  const num = v => { const n = Number(String(v ?? '').replace(/[^0-9.-]/g, '')); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
+  const bssamt = num(x.bssamt);
+  const netCost = num(x.bssamtPurcnstcst || x.purcnstcst);
+  const aItems = [
+    ['안전보건', num(x.sftyMngcst)], ['안전관리', num(x.sftyChckMngcst)], ['품질관리', num(x.qltyMngcst)],
+    ['퇴직공제', num(x.rtrfundNon)], ['건강보험', num(x.mrfnHealthInsrprm)], ['국민연금', num(x.npnInsrprm)], ['노인요양', num(x.odsnLngtrmrcprInsrprm)],
+  ].filter(([, v]) => v > 0);
+  const aVal = aItems.reduce((s, [, v]) => s + v, 0);
+  const rngRaw = Math.abs(parseFloat(String(x.rsrvtnPrceRngBgnRate || x.rsrvtnPrceRngEndRate || '').replace(/[^0-9.-]/g, '')));
+  return {
+    bssamt, netCost, aVal,
+    aBreakdown: aItems.map(([k, v]) => `${k} ${fmt(Math.round(v / 10000))}만`).join(' · '),
+    rngPct: rngRaw === 2 || rngRaw === 3 ? rngRaw : 3,
+  };
+}
+
+function calcBidOptimalWon(estPrice, lwltPct, aVal = 0, netCost = 0) {
+  const raw = aVal > 0 ? (estPrice - aVal) * (lwltPct / 100) + aVal : estPrice * (lwltPct / 100);
+  const calcBid = Math.ceil(Math.max(0, raw) / 1000) * 1000;
+  const netFloor = netCost > 0 ? Math.ceil((netCost * 0.98) / 1000) * 1000 : 0;
+  const netWarn = netFloor > 0 && calcBid < netFloor;
+  return { calcBid, netFloor, netWarn, finalBid: netWarn ? netFloor : calcBid };
+}
+
+function gen15Slots(rngPct = 3) {
+  const slots = [];
+  const step = (rngPct * 2) / 15;
+  for (let i = 0; i < 15; i++) slots.push(Number((-rngPct + i * step + (Math.random() * 0.65 + 0.175) * step).toFixed(3)));
+  return slots;
+}
+
+function analyze1365(slots, baseWon, lwltPct, aVal, netCost) {
+  const rates = [];
+  for (let a = 0; a < 12; a++) for (let b = a + 1; b < 13; b++) for (let c = b + 1; c < 14; c++) for (let d = c + 1; d < 15; d++) {
+    rates.push((slots[a] + slots[b] + slots[c] + slots[d]) / 4);
+  }
+  rates.sort((x, y) => x - y);
+  const pick = p => rates[Math.min(rates.length - 1, Math.floor(rates.length * p))] || 0;
+  const toBid = r => calcBidOptimalWon(Math.round(baseWon * (1 + r / 100)), lwltPct, aVal, netCost).finalBid;
+  const rMin = rates[0] || 0, rMax = rates[rates.length - 1] || 0;
+  const bins = Array(7).fill(0);
+  const span = Math.max(0.001, rMax - rMin);
+  rates.forEach(r => { bins[Math.min(6, Math.floor(((r - rMin) / span) * 7))]++; });
+  return {
+    count: rates.length, rP10: pick(0.1), rMed: pick(0.5), rP90: pick(0.9),
+    bidP10: toBid(pick(0.1)), bidMed: toBid(pick(0.5)), bidP90: toBid(pick(0.9)),
+    bins, maxBin: Math.max(1, ...bins),
+  };
+}
+
+function evalQualScore(it) {
+  const qp = QUAL_PROFILE;
   const dt = it.detail || {};
-  const initBase = dt.asignWon || dt.presmptWon || (it.budgetMan > 0 ? it.budgetMan * 10000 : 0);
-  if (!initBase && it.stageType !== 'bid') return '';
-  const rateNum = parseFloat(String(dt.awardRate || '').replace('%', '')) || 87.745;
+  const bsis = it._bsis || {};
+  const baseWon = bsis.bssamt || dt.asignWon || dt.presmptWon || (it.budgetMan > 0 ? it.budgetMan * 10000 : 0);
+  const creditMap = { AAA: 15, AA: 15, A: 14.5, BBB: 14, BB: 13.5, B: 12.5, CCC: 11 };
+  const creditScore = creditMap[qp.credit] ?? 14;
+  const perfWon = (Number(qp.perfEok) || 0) * 1e8;
+  const ratio = baseWon > 0 ? perfWon / baseWon : 1;
+  const perfScore = ratio >= 1 ? 15 : (ratio >= 0.7 ? 13.5 : (ratio >= 0.5 ? 12 : Math.max(6, Number((ratio * 15).toFixed(1)))));
+  const priceScore = 65;
+  const bonusScore = Math.min(3, Math.max(0, Number(qp.bonus) || 0));
+  const total = Number((creditScore + perfScore + priceScore + bonusScore).toFixed(1));
+  const cutoff = Number(qp.cutoff) || 95;
+  return { creditScore, perfScore, priceScore, bonusScore, total, cutoff, pass: total >= cutoff, ratio, baseWon };
+}
+
+function renderQualBoxHtml(it) {
+  const qp = QUAL_PROFILE;
+  const q = evalQualScore(it);
   return `
-    <div class="sec"><h4>🎯 투찰가 · 사정률 자동 시뮬레이터</h4><div class="sales">
-      <div style="display:grid;grid-template-columns:1fr 110px;gap:6px;margin-bottom:8px">
-        <label class="tiny">기초금액/배정예산 (원)<input class="inp" id="dSimBase" type="number" value="${initBase || 100000000}" step="100000" style="height:32px;margin-top:2px"></label>
-        <label class="tiny">낙찰하한율 (%)<input class="inp" id="dSimRate" type="number" value="${rateNum}" step="0.005" min="10" max="100" style="height:32px;margin-top:2px"></label>
+    <div class="sec"><h4>✅ 적격심사 자사 점수 자동 판정 <button type="button" class="iconbtn sm" id="dQualEditBtn" style="margin-left:auto">⚙️ 자사 스펙</button></h4><div class="sales">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 9px;border-radius:8px;background:var(--surface);border:1px solid ${q.pass ? '#a7f3d0' : '#fecaca'};margin-bottom:6px">
+        <div>
+          <div style="font-size:12px;font-weight:800;color:${q.pass ? '#059669' : '#dc2626'}">${q.pass ? `🟢 통과 유력 (${q.total}점 / 기준 ${q.cutoff}점)` : `🟠 보완 필요 (${q.total}점 · ${(q.cutoff - q.total).toFixed(1)}점 부족)`}</div>
+          <div class="tiny" style="margin-top:2px">신용 ${qp.credit}(${q.creditScore}) + 실적 ${qp.perfEok}억(${q.perfScore}, ${q.baseWon > 0 ? (q.ratio * 100).toFixed(0) + '%' : '충족'}) + 가격 ${q.priceScore} + 신인도 ${q.bonusScore}</div>
+        </div>
+        <span class="sb" style="background:${q.pass ? '#ecfdf5' : '#fef2f2'};color:${q.pass ? '#047857' : '#b91c1c'}">${q.pass ? 'PASS' : '공동도급권장'}</span>
       </div>
-      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px"><span>예상 사정률</span><b id="dSimLbl" style="color:var(--accent)">0.0% (예정가격 100.0%)</b></div>
-      <input id="dSimRange" type="range" min="-3" max="3" step="0.1" value="0" style="width:100%;margin-bottom:8px">
-      <div id="dSimRes" style="padding:8px 10px;border-radius:8px;background:var(--surface);border:1px solid var(--line);margin-bottom:8px"></div>
-      <div id="dSimGrid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;font-size:11px"></div>
+      <div id="dQualForm" hidden style="display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface)">
+        <label class="tiny">신용등급<select class="inp" id="dQpCredit" style="height:30px;margin-top:2px">${['AAA', 'AA', 'A', 'BBB', 'BB', 'B', 'CCC'].map(g => `<option value="${g}" ${qp.credit === g ? 'selected' : ''}>${g}</option>`).join('')}</select></label>
+        <label class="tiny">최근 실적(억)<input class="inp" id="dQpPerf" type="number" step="0.5" value="${qp.perfEok}" style="height:30px;margin-top:2px"></label>
+        <label class="tiny">신인도 가점<input class="inp" id="dQpBonus" type="number" step="0.5" min="0" max="3" value="${qp.bonus}" style="height:30px;margin-top:2px"></label>
+        <label class="tiny">통과 기준점<input class="inp" id="dQpCut" type="number" min="70" max="100" value="${qp.cutoff}" style="height:30px;margin-top:2px"></label>
+        <button type="button" class="iconbtn sm" id="dQpSave" style="grid-column:span 2;background:var(--accent);color:#fff;border-color:var(--accent)">💾 자사 스펙 저장 · 재판정</button>
+      </div>
     </div></div>`;
 }
 
-function wireBidSim() {
+function wireQualBox(it) {
+  if ($('#dQualEditBtn')) $('#dQualEditBtn').onclick = () => { const f = $('#dQualForm'); if (f) f.hidden = !f.hidden; };
+  if ($('#dQpSave')) $('#dQpSave').onclick = () => {
+    QUAL_PROFILE = {
+      credit: $('#dQpCredit')?.value || 'BBB',
+      perfEok: Math.max(0, Number($('#dQpPerf')?.value) || 0),
+      bonus: Math.min(3, Math.max(0, Number($('#dQpBonus')?.value) || 0)),
+      cutoff: Math.min(100, Math.max(70, Number($('#dQpCut')?.value) || 95)),
+    };
+    try { localStorage.setItem('bid_qual_profile_v1', JSON.stringify(QUAL_PROFILE)); } catch {}
+    toast('✅ 자사 적격심사 프로필 저장 완료!');
+    openDetail(it.id);
+  };
+}
+
+function renderAwardHist(rates) {
+  if (!rates || rates.length < 2) return '';
+  const minR = Math.floor(Math.min(...rates) * 2) / 2;
+  const maxR = Math.ceil(Math.max(...rates) * 2) / 2;
+  const span = Math.max(0.5, maxR - minR);
+  const bCnt = Math.min(7, Math.max(3, Math.ceil(span / 0.5)));
+  const step = span / bCnt;
+  const bins = Array.from({ length: bCnt }, (_, i) => ({ lo: minR + i * step, hi: minR + (i + 1) * step, cnt: 0 }));
+  rates.forEach(r => { bins[Math.min(bCnt - 1, Math.max(0, Math.floor((r - minR) / step)))].cnt++; });
+  const maxC = Math.max(1, ...bins.map(b => b.cnt));
+  const modeBin = bins.reduce((best, b) => (b.cnt > best.cnt ? b : best), bins[0]);
+  const modeMid = Number(((modeBin.lo + modeBin.hi) / 2).toFixed(2));
+  return `<div style="padding:7px 8px;border-radius:8px;background:var(--surface);border:1px solid var(--line);margin-bottom:8px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><b>📈 낙찰률 분포도</b><span style="color:var(--accent);font-weight:800">최빈 ${modeBin.lo.toFixed(1)}~${modeBin.hi.toFixed(1)}% (${modeBin.cnt}건)</span></div>
+    <div style="display:flex;align-items:flex-end;gap:4px;height:42px">${bins.map(b => {
+      const h = Math.max(12, Math.round((b.cnt / maxC) * 100));
+      const isM = b === modeBin;
+      return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end"><div style="font-size:9px;color:${isM ? 'var(--accent)' : 'var(--muted)'}">${b.cnt || ''}</div><div style="width:100%;height:${h}%;border-radius:3px 3px 0 0;background:${isM ? 'var(--accent)' : 'rgba(100,116,139,.28)'}"></div></div>`;
+    }).join('')}</div>
+    <div style="display:flex;justify-content:space-between;font-size:9.5px;color:var(--muted);margin-top:2px"><span>${minR.toFixed(1)}%</span><button type="button" id="dApplyModeRate" data-mode="${modeMid}" style="border:none;background:none;color:var(--accent);font-weight:800;font-size:10.5px;cursor:pointer;padding:0">⚡ 최빈 중앙(${modeMid}%) 적용</button><span>${maxR.toFixed(1)}%</span></div>
+  </div>`;
+}
+
+function renderBidSimHtml(it) {
+  const dt = it.detail || {};
+  const bsis = it._bsis || {};
+  const initBase = bsis.bssamt || dt.asignWon || dt.presmptWon || (it.budgetMan > 0 ? it.budgetMan * 10000 : 0);
+  if (!initBase && it.stageType !== 'bid') return '';
+  const rateNum = parseFloat(String(dt.awardRate || '').replace('%', '')) || 87.745;
+  const bidNoHint = dt.bidNo || (String(it.id || '').startsWith('g2b-') ? String(it.id).slice(4) : '');
+  const initRng = bsis.rngPct || 3;
+  return `
+    <div class="sec"><h4>🎯 K-Bid급 투찰가 · A값 · 복수예가 시뮬레이터 ${bidNoHint ? `<button type="button" class="iconbtn sm" id="dSimLoadBsis" style="margin-left:auto">${bsis.bssamt ? '🔄 기초금액 재조회' : '🔍 기초금액·A값 자동조회'}</button>` : ''}</h4><div class="sales">
+      ${bsis.bssamt ? `<div style="font-size:11px;padding:5px 8px;border-radius:6px;background:rgba(16,185,129,.1);color:#047857;margin-bottom:7px;font-weight:600">✅ 실측 기초금액 ${fmt(bsis.bssamt)}원 · ±${bsis.rngPct}%${bsis.aVal > 0 ? ` · A값 ${fmt(bsis.aVal)}원` : ''}${bsis.netCost > 0 ? ` · 순공사 ${fmt(bsis.netCost)}원` : ''}</div>` : ''}
+      <div style="display:grid;grid-template-columns:1fr 105px;gap:6px;margin-bottom:6px">
+        <label class="tiny">기초금액/배정예산 (원)<input class="inp" id="dSimBase" type="number" value="${initBase || 100000000}" step="100000" style="height:32px;margin-top:2px"></label>
+        <label class="tiny">낙찰하한율 (%)<input class="inp" id="dSimRate" type="number" value="${rateNum}" step="0.005" min="10" max="100" style="height:32px;margin-top:2px"></label>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px">
+        <label class="tiny">A값 합계 (안전·보험, 원)<input class="inp" id="dSimAVal" type="number" value="${bsis.aVal || 0}" step="10000" min="0" style="height:30px;margin-top:2px"></label>
+        <label class="tiny">순공사원가 (98% 검증, 원)<input class="inp" id="dSimNetCost" type="number" value="${bsis.netCost || 0}" step="100000" min="0" style="height:30px;margin-top:2px"></label>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px"><span>예상 사정률</span><b id="dSimLbl" style="color:var(--accent)">0.00% (예정가격 100.00%)</b></div>
+      <input id="dSimRange" type="range" min="-3" max="3" step="0.05" value="0" style="width:100%;margin-bottom:8px">
+      <div id="dSimRes" style="padding:8px 10px;border-radius:8px;background:var(--surface);border:1px solid var(--line);margin-bottom:8px"></div>
+      <div id="dSimGrid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;font-size:11px;margin-bottom:8px"></div>
+      <div style="padding:8px;border-radius:8px;background:var(--surface);border:1px solid var(--line)">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:4px;flex-wrap:wrap;margin-bottom:6px">
+          <b style="font-size:11.5px;color:var(--accent)">🎲 복수예가 15개 · 1,365조합</b>
+          <div style="display:flex;gap:4px">
+            <button type="button" class="chip" data-dsim-rng="2" aria-pressed="${initRng === 2}" style="padding:2px 7px;font-size:10.5px">±2%</button>
+            <button type="button" class="chip" data-dsim-rng="3" aria-pressed="${initRng !== 2}" style="padding:2px 7px;font-size:10.5px">±3%</button>
+            <button type="button" class="iconbtn sm" id="dSimDraw4" style="padding:2px 7px;font-size:10.5px">🎲 4개 추첨</button>
+            <button type="button" class="iconbtn sm" id="dSimRegen15" style="padding:2px 7px;font-size:10.5px">🔄</button>
+          </div>
+        </div>
+        <div id="dSim15Grid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin-bottom:6px"></div>
+        <div id="dSim1365" class="tiny"></div>
+      </div>
+    </div></div>`;
+}
+
+function wireBidSim(it) {
   const baseEl = $('#dSimBase'), rateEl = $('#dSimRate'), rngEl = $('#dSimRange');
+  const aEl = $('#dSimAVal'), netEl = $('#dSimNetCost');
   const lblEl = $('#dSimLbl'), resEl = $('#dSimRes'), gridEl = $('#dSimGrid');
+  const g15 = $('#dSim15Grid'), stEl = $('#dSim1365');
   if (!baseEl || !rateEl || !rngEl || !resEl) return;
+  let rngPct = it?._bsis?.rngPct || 3;
+  let slots15 = gen15Slots(rngPct);
+  let picked = new Set([4, 6, 8, 10]);
+
   const calc = () => {
     const base = Math.max(0, Number(baseEl.value) || 0);
     const lwlt = Math.max(1, Math.min(100, Number(rateEl.value) || 87.745));
+    const aVal = Math.max(0, Number(aEl?.value) || 0);
+    const netCost = Math.max(0, Number(netEl?.value) || 0);
     const ass = Number(rngEl.value) || 0;
     const est = Math.round(base * (1 + ass / 100));
-    const minBid = Math.ceil((est * (lwlt / 100)) / 1000) * 1000;
-    lblEl.textContent = `${ass >= 0 ? '+' : ''}${ass.toFixed(1)}% (예정가격 ${(100 + ass).toFixed(1)}%)`;
-    resEl.innerHTML = `<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px"><span class="tiny">예상 예정가격</span><b class="num">${fmt(est)}원</b></div>
-      <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:12px;font-weight:700;color:var(--accent)">최적 투찰 하한가 (${lwlt}%)</span>
-      <span style="display:flex;align-items:center;gap:6px"><b class="num" style="font-size:14px;color:#059669">${fmt(minBid)}원</b><button type="button" class="cp" id="dSimCopy">복사</button></span></div>`;
-    $('#dSimCopy').onclick = () => copy(String(minBid));
+    const { calcBid, netFloor, netWarn, finalBid } = calcBidOptimalWon(est, lwlt, aVal, netCost);
+    window._lastBidSimWon = finalBid;
+    lblEl.textContent = `${ass >= 0 ? '+' : ''}${ass.toFixed(2)}% (예정가격 ${(100 + ass).toFixed(2)}%)`;
+    resEl.innerHTML = `<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px"><span class="tiny">예상 예정가격${aVal > 0 ? ' (A값 공식)' : ''}</span><b class="num">${fmt(est)}원</b></div>
+      <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:12px;font-weight:700;color:var(--accent)">${netWarn ? '안전 최저한도 (순공사 98%)' : `최적 투찰 하한가 (${lwlt}%)`}</span>
+      <span style="display:flex;align-items:center;gap:6px"><b class="num" style="font-size:14px;color:${netWarn ? '#dc2626' : '#059669'}">${fmt(finalBid)}원</b><button type="button" class="cp" id="dSimCopy">복사</button></span></div>
+      ${aVal > 0 ? `<div class="tiny" style="margin-top:3px">산식: (${fmt(est)} - A값 ${fmt(aVal)}) × ${lwlt}% + A값 = ${fmt(calcBid)}원</div>` : ''}
+      ${netWarn ? `<div style="margin-top:5px;padding:4px 7px;border-radius:6px;background:rgba(220,38,38,.1);color:#b91c1c;font-size:11px;font-weight:700">⚠️ 순공사원가 98% 미달 경고! 최소 ${fmt(netFloor)}원 이상 투찰 필수</div>` : ''}`;
+    $('#dSimCopy').onclick = () => copy(String(finalBid));
     gridEl.innerHTML = [-2, -1, 0, 0.5, 1, 2].map(s => {
-      const bid = Math.ceil((base * (1 + s / 100) * (lwlt / 100)) / 1000) * 1000;
-      const on = Math.abs(s - ass) < 0.05;
+      const bid = calcBidOptimalWon(Math.round(base * (1 + s / 100)), lwlt, aVal, netCost).finalBid;
+      const on = Math.abs(s - ass) < 0.06;
       return `<div style="padding:5px;border-radius:6px;border:1px solid ${on ? 'var(--accent)' : 'var(--line)'};text-align:center;background:var(--surface)"><div class="tiny">${s >= 0 ? '+' : ''}${s.toFixed(1)}%</div><b class="num">${(bid / 1e8).toFixed(2)}억</b></div>`;
     }).join('');
+    if (g15 && stEl) {
+      g15.innerHTML = slots15.map((v, idx) => {
+        const on = picked.has(idx);
+        return `<button type="button" data-ds15="${idx}" style="padding:4px 2px;border-radius:6px;border:1px solid ${on ? 'var(--accent)' : 'var(--line)'};background:${on ? 'var(--accent)' : 'var(--card)'};color:${on ? '#fff' : 'var(--ink)'};font-size:10px;font-weight:${on ? 800 : 600};cursor:pointer"><div>#${String(idx + 1).padStart(2, '0')}</div><div>${v >= 0 ? '+' : ''}${v.toFixed(2)}%</div></button>`;
+      }).join('');
+      g15.querySelectorAll('[data-ds15]').forEach(b => {
+        b.onclick = () => {
+          const idx = Number(b.dataset.ds15);
+          if (picked.has(idx)) picked.delete(idx);
+          else { if (picked.size >= 4) picked.delete([...picked][0]); picked.add(idx); }
+          if (picked.size === 4) rngEl.value = ([...picked].reduce((s, i) => s + slots15[i], 0) / 4).toFixed(2);
+          calc();
+        };
+      });
+      const st = analyze1365(slots15, base, lwlt, aVal, netCost);
+      stEl.innerHTML = `<div style="display:flex;justify-content:space-between;margin-bottom:4px"><span>선택 ${picked.size}/4 · <b>${fmt(st.count)}조합</b></span><b style="color:#059669">중앙 추천 ${fmt(st.bidMed)}원</b></div>
+        <div style="display:flex;align-items:flex-end;gap:3px;height:26px;margin-bottom:3px">${st.bins.map((cnt, bi) => `<div style="flex:1;height:${Math.max(15, Math.round((cnt / st.maxBin) * 100))}%;border-radius:3px 3px 0 0;background:${bi === 3 ? 'var(--accent)' : 'rgba(15,118,110,.32)'}"></div>`).join('')}</div>
+        <div style="display:flex;justify-content:space-between;font-size:10px"><span>10%: ${(st.bidP10 / 1e8).toFixed(2)}억</span><span>90%: ${(st.bidP90 / 1e8).toFixed(2)}억</span></div>`;
+    }
+  };
+  if ($('#dSimDraw4')) $('#dSimDraw4').onclick = () => {
+    const idxs = Array.from({ length: 15 }, (_, i) => i).sort(() => Math.random() - 0.5).slice(0, 4);
+    picked = new Set(idxs);
+    rngEl.value = (idxs.reduce((s, i) => s + slots15[i], 0) / 4).toFixed(2);
+    calc();
+    toast(`🎲 4개 예가 추첨 완료 → 사정률 ${Number(rngEl.value) >= 0 ? '+' : ''}${rngEl.value}%`);
+  };
+  if ($('#dSimRegen15')) $('#dSimRegen15').onclick = () => { slots15 = gen15Slots(rngPct); calc(); toast(`🔄 ±${rngPct}% 15예가 재생성`); };
+  $$('[data-dsim-rng]').forEach(b => {
+    b.onclick = () => {
+      rngPct = Number(b.dataset.dsimRng) || 3;
+      $$('[data-dsim-rng]').forEach(x => x.setAttribute('aria-pressed', Number(x.dataset.dsimRng) === rngPct));
+      slots15 = gen15Slots(rngPct); calc();
+    };
+  });
+  if ($('#dSimLoadBsis')) $('#dSimLoadBsis').onclick = async e => {
+    const b = e.currentTarget;
+    const bidNo = it?.detail?.bidNo || (String(it?.id || '').startsWith('g2b-') ? String(it.id).slice(4) : '');
+    if (!bidNo) return;
+    b.disabled = true; b.textContent = '조회 중…';
+    const bsis = await fetchBidBsisAmountLive(bidNo);
+    if (bsis && bsis.bssamt > 0) { it._bsis = bsis; toast(`✅ 기초금액 ${fmt(bsis.bssamt)}원 자동 반영!`); openDetail(it.id); }
+    else { b.disabled = false; b.textContent = '🔍 재시도'; toast('ℹ️ 기초금액 미공개 공고입니다.'); }
   };
   baseEl.oninput = rateEl.oninput = rngEl.oninput = calc;
+  if (aEl) aEl.oninput = calc;
+  if (netEl) netEl.oninput = calc;
   calc();
 }
 
@@ -1470,11 +1702,11 @@ function matchAwardBenchmarks(it, awards) {
   const stop = new Set(['2026', '2026년', '2027', '2027년', '공사', '용역', '물품', '구매', '입찰', '공고', '긴급', '사업', '설치', '교체', '유지', '관리', '위탁']);
   const kws = [...new Set((String(it.title || '').match(/[가-힣A-Za-z0-9]{2,}/g) || []).filter(w => !stop.has(w)))].slice(0, 6);
   const similar = awards.filter(a => !sameOrg.includes(a) && kws.some(k => `${a.title} ${a.org}`.includes(k)));
-  const pool = [...sameOrg.slice(0, 8), ...similar.slice(0, Math.max(0, 8 - sameOrg.length))];
+  const pool = [...sameOrg.slice(0, 12), ...similar.slice(0, Math.max(0, 12 - sameOrg.length))];
   const rates = pool.map(x => x.rate).filter(v => v !== null && v > 20 && v <= 105);
   const bids = pool.map(x => x.bidders).filter(v => v > 0);
   return {
-    sameOrg: sameOrg.slice(0, 5), similar: similar.slice(0, 5), pool: pool.slice(0, 5),
+    sameOrg: sameOrg.slice(0, 5), similar: similar.slice(0, 5), pool: pool.slice(0, 5), rates,
     avgRate: rates.length ? rates.reduce((s, v) => s + v, 0) / rates.length : null,
     avgBidders: bids.length ? bids.reduce((s, v) => s + v, 0) / bids.length : null,
     totalScanned: awards.length,
@@ -1483,15 +1715,19 @@ function matchAwardBenchmarks(it, awards) {
 
 function openA4BidReview(it) {
   const dt = it.detail || {};
+  const bsis = it._bsis || {};
   const files = it.attachments || [];
   const partners = findPartnerBuilders(it, 5);
   const bm = AWARD_CACHE.loaded ? matchAwardBenchmarks(it, AWARD_CACHE.list) : null;
-  const baseWon = dt.asignWon || dt.presmptWon || (it.budgetMan > 0 ? it.budgetMan * 10000 : 0);
-  const lwlt = parseFloat(String(dt.awardRate || '').replace('%', '')) || 87.745;
+  const qual = evalQualScore(it);
+  const baseWon = Number($('#dSimBase')?.value) || bsis.bssamt || dt.asignWon || dt.presmptWon || (it.budgetMan > 0 ? it.budgetMan * 10000 : 0);
+  const lwlt = Number($('#dSimRate')?.value) || parseFloat(String(dt.awardRate || '').replace('%', '')) || 87.745;
+  const aVal = Number($('#dSimAVal')?.value) || bsis.aVal || 0;
+  const netCost = Number($('#dSimNetCost')?.value) || bsis.netCost || 0;
   const simRows = baseWon > 0 ? [-2, -1, 0, 0.5, 1, 2].map(s => {
     const est = Math.round(baseWon * (1 + s / 100));
-    const bid = Math.ceil((est * (lwlt / 100)) / 1000) * 1000;
-    return `<tr><td>${s >= 0 ? '+' : ''}${s.toFixed(1)}%</td><td>${fmt(est)}원</td><td><b>${fmt(bid)}원</b></td><td>${(bid / 1e8).toFixed(2)}억</td></tr>`;
+    const { finalBid, netWarn } = calcBidOptimalWon(est, lwlt, aVal, netCost);
+    return `<tr><td>${s >= 0 ? '+' : ''}${s.toFixed(1)}%</td><td>${fmt(est)}원</td><td><b>${fmt(finalBid)}원</b>${netWarn ? ' ⚠️98%' : ''}</td><td>${(finalBid / 1e8).toFixed(2)}억</td></tr>`;
   }).join('') : '';
   const ex = $('#bidA4Overlay'); if (ex) ex.remove();
   const wrap = document.createElement('div');
@@ -1504,9 +1740,10 @@ function openA4BidReview(it) {
   <div class="kpis">
     <div class="kpi"><div class="l">배정예산 / 추정가격</div><div class="v">${baseWon > 0 ? (baseWon / 1e8).toFixed(2) + '억' : fmtBudget(it.budgetMan)}</div></div>
     <div class="kpi"><div class="l">입찰마감 (D-Day)</div><div class="v">${esc(it.closeDate || '-')}${it._dday !== null && it._dday >= 0 ? ` (D-${it._dday})` : ''}</div></div>
-    <div class="kpi"><div class="l">낙찰하한율 / 등급</div><div class="v">${esc(dt.awardRate || `${lwlt}%`)} · ${it._grade}(${it._score}점)</div></div>
+    <div class="kpi"><div class="l">적격심사 자사 판정</div><div class="v" style="color:${qual.pass ? '#059669' : '#dc2626'}">${qual.pass ? '통과유력' : '보완필요'} (${qual.total}점)</div></div>
     <div class="kpi"><div class="l">첨부서류 / 공고구분</div><div class="v">${files.length}건 · ${esc(dt.ntceKind || '등록공고')}</div></div>
   </div>
+  ${aVal > 0 || netCost > 0 ? `<div style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;font-size:11px;margin-bottom:8px">${aVal > 0 ? `<b>A값 적용:</b> ${fmt(aVal)}원 &nbsp;` : ''}${netCost > 0 ? `<b>순공사원가 98%:</b> ${fmt(Math.ceil((netCost * 0.98) / 1000) * 1000)}원` : ''}</div>` : ''}
   <h3>1. 입찰 상세내역 및 일정</h3>
   <table>
     <tr><th>발주기관</th><td>${esc(it.org || '-')}</td><th>공고번호/차수</th><td>${esc(dt.bidNo || it.id)}</td></tr>
@@ -1628,8 +1865,10 @@ function openDetail(id) {
 
     ${renderBidSimHtml(it)}
 
+    ${renderQualBoxHtml(it)}
+
     <div class="sec"><h4>📊 과거 낙찰결과 · 경쟁사 투찰률 분석 <button type="button" class="iconbtn sm" id="btnLoadAwards" style="margin-left:auto">${AWARD_CACHE.loaded ? '🔄 재분석' : '🔍 실시간 낙찰 분석'}</button></h4><div class="sales" id="dAwardBox">
-      <p class="tiny" style="margin:0">나라장터 낙찰정보 API(최근 14일 용역·공사·물품)에서 동일 발주기관·유사 공고의 평균 낙찰률과 주요 낙찰사를 분석합니다.</p>
+      <p class="tiny" style="margin:0">나라장터 낙찰정보 API(최근 8일 용역·공사·물품)에서 동일 발주기관·유사 공고의 평균 낙찰률·분포도와 주요 낙찰사를 분석합니다.</p>
     </div></div>
 
     ${(() => {
@@ -1674,17 +1913,19 @@ function openDetail(id) {
     }
   };
   $('#dCmpBtn').onclick = () => { toggleCompare(id); openDetail(id); };
-  wireBidSim();
+  wireBidSim(it);
+  wireQualBox(it);
   const renderAwardUi = awards => {
     const box = $('#dAwardBox'); if (!box) return;
     const bm = matchAwardBenchmarks(it, awards);
-    if (!bm.pool.length) { box.innerHTML = `<p class="tiny" style="margin:0">최근 14일 낙찰 ${fmt(bm.totalScanned)}건 중 동일 기관/유사 공고 이력이 없습니다.</p>`; return; }
+    if (!bm.pool.length) { box.innerHTML = `<p class="tiny" style="margin:0">최근 8일 낙찰 ${fmt(bm.totalScanned)}건 중 동일 기관/유사 공고 이력이 없습니다.</p>`; return; }
     box.innerHTML = `
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px;text-align:center">
         <div style="padding:6px;border-radius:7px;background:var(--surface);border:1px solid var(--line)"><div class="tiny">평균 낙찰률</div><b class="num" style="color:var(--accent)">${bm.avgRate ? bm.avgRate.toFixed(2) + '%' : '-'}</b></div>
         <div style="padding:6px;border-radius:7px;background:var(--surface);border:1px solid var(--line)"><div class="tiny">평균 경쟁률</div><b class="num" style="color:#059669">${bm.avgBidders ? bm.avgBidders.toFixed(1) + '사' : '-'}</b></div>
         <div style="padding:6px;border-radius:7px;background:var(--surface);border:1px solid var(--line)"><div class="tiny">기관/유사</div><b class="num">${bm.sameOrg.length}/${bm.similar.length}건</b></div>
       </div>
+      ${renderAwardHist(bm.rates)}
       ${bm.avgRate ? `<button type="button" class="iconbtn sm" id="dApplyAvgRate" style="width:100%;margin-bottom:8px">🎯 평균 낙찰률(${bm.avgRate.toFixed(2)}%) 시뮬레이터 적용</button>` : ''}
       <div style="display:flex;flex-direction:column;gap:5px">${bm.pool.map(x => `
         <div style="padding:6px 8px;border:1px solid var(--line);border-radius:7px;background:var(--surface);font-size:11.5px">
@@ -1697,6 +1938,11 @@ function openDetail(id) {
     if ($('#dApplyAvgRate')) $('#dApplyAvgRate').onclick = () => {
       const el = $('#dSimRate');
       if (el && bm.avgRate) { el.value = bm.avgRate.toFixed(3); el.dispatchEvent(new Event('input')); toast(`🎯 평균 낙찰률 ${bm.avgRate.toFixed(2)}% 반영`); }
+    };
+    if ($('#dApplyModeRate')) $('#dApplyModeRate').onclick = ev => {
+      const el = $('#dSimRate');
+      const mv = parseFloat(ev.currentTarget.dataset.mode);
+      if (el && Number.isFinite(mv)) { el.value = mv.toFixed(3); el.dispatchEvent(new Event('input')); toast(`⚡ 최빈 중앙값 ${mv.toFixed(2)}% 반영`); }
     };
   };
   if (AWARD_CACHE.loaded) renderAwardUi(AWARD_CACHE.list);

@@ -1,5 +1,5 @@
-const CACHE = 'bidopp-pwa-v21';
-const SHELL = ['./', './index.html', './styles.css?v=21', './app.js?v=21', './vworld.js', './vendor/leaflet.css', './vendor/leaflet.min.js', './manifest.json', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'];
+const CACHE = 'bidopp-pwa-v22';
+const SHELL = ['./', './index.html', './styles.css?v=22', './app.js?v=22', './vworld.js', './vendor/leaflet.css', './vendor/leaflet.min.js', './manifest.json', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
