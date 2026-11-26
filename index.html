@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="theme-color" content="#0f766e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="입찰영업기회">
+<title>공동주택 · 관공서 · 건설사 영업기회 · 입찰정보</title>
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" type="image/svg+xml" href="./icons/icon.svg">
+<link rel="apple-touch-icon" href="./icons/icon-192.png">
+<link rel="stylesheet" href="./vendor/leaflet.css">
+<link rel="stylesheet" href="./styles.css?v=21">
+</head>
+<body data-view="list">
+
+<!-- ===== Private Vault Lock Screen ===== -->
+<div class="lock-screen" id="lockScreen">
+  <form class="lock-card" id="lockForm" autocomplete="off">
+    <div class="lock-head">
+      <div class="lock-badge">🔒</div>
+      <h1>비공개 입찰·영업기회</h1>
+      <p>공동주택 · 관공서 · 건설사 (AES-256-GCM)<br>비밀번호를 입력해야 조회할 수 있습니다.</p>
+    </div>
+    <div class="pw-wrap">
+      <input id="pwInput" type="password" placeholder="접속 비밀번호 입력" autocomplete="current-password" required>
+      <button type="button" class="pw-eye" id="pwToggle" aria-label="비밀번호 보기">👁</button>
+    </div>
+    <label class="toggle" style="margin-top:12px">
+      <input type="checkbox" id="pwRemember" checked>
+      <span>이 기기에서 로그인 유지 (모바일 자동 잠금 해제)</span>
+    </label>
+    <div class="lock-err" id="lockErr"></div>
+    <button type="submit" class="lock-submit" id="pwSubmit">잠금 해제</button>
+    <div class="lock-foot">
+      모든 데이터는 브라우저 안에서만 복호화됩니다.<br>
+      기업분석 앱과 별도로 분리된 독립 보안 저장소입니다.
+    </div>
+  </form>
+</div>
+
+<div class="loader" id="loader" hidden><div class="box">
+  <div class="brand" style="justify-content:center;font-size:17px"><span class="logo">bid</span>입찰·영업기회 복호화 중</div>
+  <div class="bar"><i id="lbar"></i></div>
+  <div class="tiny" id="ltxt">암호화 데이터 불러오는 중…</div>
+</div></div>
+
+<div id="appShell" hidden>
+<header>
+  <div class="hrow">
+    <div class="brand"><span class="logo">bid</span><span class="txt">입찰·영업기회<small id="srcTxt">공동주택 · 관공서 · 건설사</small></span></div>
+    <div class="search" id="searchBox">
+      <svg class="ic" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" type="search" autocomplete="off" placeholder="공고명 · 단지명 · 발주처 · 지역 · 키워드(CCTV, 승강기, 경비) · 초성" aria-label="통합 검색">
+      <button class="clr" id="qclr" aria-label="지우기">✕</button>
+    </div>
+    <button class="iconbtn fbtn" id="openF"><span class="txt">조건</span><span class="badge" id="fcount" hidden>0</span></button>
+    <button class="iconbtn" id="openSettings" title="설정 · API 키 · 테마 · 백업">⚙️</button>
+    <button class="iconbtn" id="lockNowBtn" title="즉시 잠금 (로그아웃)">🔒</button>
+  </div>
+</header>
+
+<main class="app">
+  <!-- ===== Filters ===== -->
+  <section class="panel" id="filterPanel" aria-label="상세 조건">
+    <div class="ph"><h2>영업기회 필터</h2>
+      <div><button class="resetbtn" id="resetAll">초기화</button>
+      <button class="iconbtn sm fclose" id="closeF">닫기</button></div>
+    </div>
+    <div class="scroll"><div class="filters">
+      <div class="fg" style="padding-top:8px"><span class="lbl">💾 저장된 조건 프리셋</span>
+        <div style="display:flex;gap:6px">
+          <input class="inp" id="presetNameIn" placeholder="예: 인천 CCTV 긴급입찰" style="height:34px">
+          <button class="iconbtn sm" id="savePresetBtn" style="height:34px">저장</button>
+        </div>
+        <div class="preset-list" id="presetList"></div>
+      </div>
+
+      <button class="aibtn" id="qTodayBid" style="background:linear-gradient(135deg,#059669,#0d9488);color:#fff;border-color:#059669">📅 당일 입찰건만 보기 (오늘)</button>
+      <div style="display:flex;gap:5px">
+        <button class="aibtn" id="qMyKw" style="flex:1;margin:0;background:linear-gradient(135deg,#4f46e5,#6366f1);color:#fff;border-color:#4f46e5">⭐ 내 관심 키워드만</button>
+        <button class="iconbtn sm" id="qEditKw" title="내 관심 키워드 편집" style="height:auto;padding:0 10px">⚙️</button>
+      </div>
+      <button class="aibtn urg" id="qUrgent">🚨 마감 임박 긴급입찰 (D-3)</button>
+      <button class="aibtn" id="qSecAi">🛡 보안 · AI CCTV · 관제 특화</button>
+      <button class="aibtn apt" id="qAptGold">🏘 노후 공동주택 교체 골든타임</button>
+
+      <div class="fg"><span class="lbl">대상 구분</span>
+        <div class="chips" id="catChips">
+          <button class="chip" data-cat="apt">🏘 공동주택</button>
+          <button class="chip" data-cat="gov">🏛 관공서</button>
+          <button class="chip" data-cat="construction">🏗 건설·착공</button>
+        </div>
+      </div>
+
+      <div class="fg"><span class="lbl">기회 유형 (단계)</span>
+        <div class="chips" id="stageChips">
+          <button class="chip" data-st="bid">📢 입찰공고</button>
+          <button class="chip" data-st="prespec">🔭 사전규격</button>
+          <button class="chip" data-st="plan">📋 발주계획</button>
+          <button class="chip" data-st="complex">🏢 노후단지</button>
+          <button class="chip" data-st="permit">🏗 건축인허가</button>
+        </div>
+      </div>
+
+      <div class="fg"><span class="lbl">마감 D-Day · 당일 레이더</span>
+        <div class="chips" id="ddayChips">
+          <button class="chip" data-dd="todayBid">📅 당일 입찰만</button>
+          <button class="chip" data-dd="today">🗓️ 당일 전체</button>
+          <button class="chip" data-dd="3">🚨 D-3 긴급</button>
+          <button class="chip" data-dd="7">⏰ D-7 이번주</button>
+          <button class="chip" data-dd="14">📅 D-14 이내</button>
+          <button class="chip" data-dd="early">🔭 조기포착</button>
+        </div>
+      </div>
+
+      <div class="fg"><span class="lbl">자동 분류 분야</span>
+        <div class="chips" id="domChips"></div>
+      </div>
+
+      <div class="fg"><span class="lbl">예산 규모</span>
+        <div class="chips" id="budChips">
+          <button class="chip" data-bd="0">1억 미만</button>
+          <button class="chip" data-bd="1">1~5억</button>
+          <button class="chip" data-bd="2">5~20억</button>
+          <button class="chip" data-bd="3">20억 이상</button>
+        </div>
+      </div>
+
+      <div class="fg"><span class="lbl">🏆 영업 우선순위 (커스텀 ICP)</span>
+        <div class="chips" id="gradeChips">
+          <button class="chip" data-gr="S">S등급 (80+)</button>
+          <button class="chip" data-gr="A">A등급+ (70+)</button>
+          <button class="chip" data-gr="B">B등급+ (60+)</button>
+        </div>
+      </div>
+
+      <div class="fg"><span class="lbl">지역 (시·도 / 시·군·구)</span>
+        <div class="row2">
+          <select class="inp" id="fSido"><option value="">시·도 전체</option></select>
+          <select class="inp" id="fSgg"><option value="">+ 시·군·구 추가</option></select>
+        </div>
+        <div class="chips" id="sggChips" style="margin-top:8px"></div>
+      </div>
+
+      <div class="fg"><span class="lbl">💼 내 수주 파이프라인</span>
+        <div class="chips" id="crmChips"></div>
+        <label class="toggle"><input type="checkbox" id="fFav"> ⭐ 즐겨찾기만</label>
+        <label class="toggle"><input type="checkbox" id="fHideCancel" checked> 🚫 취소공고 자동 숨기기</label>
+        <label class="toggle"><input type="checkbox" id="fHideSample"> 예시 데이터 숨기기 (실 API만)</label>
+      </div>
+    </div></div>
+  </section>
+
+  <!-- ===== Opportunity List ===== -->
+  <section class="panel" id="listPanel" aria-label="영업기회 목록">
+    <div class="ph">
+      <div class="rcount"><b class="num" id="cnt">0</b> <span class="muted">건</span></div>
+      <div class="rbar">
+        <select class="sort" id="sort" aria-label="정렬">
+          <option value="score">🏆 영업기회 점수순</option>
+          <option value="dday">🚨 마감 임박순</option>
+          <option value="budget">💰 예산 큰순</option>
+          <option value="new">🆕 최신 공고순</option>
+          <option value="aptgold">🏘 노후 교체적기순</option>
+        </select>
+        <button class="iconbtn sm" id="dlCsv" title="CSV 저장">CSV</button>
+        <button class="iconbtn sm" id="copyRes" title="표 복사">복사</button>
+      </div>
+    </div>
+    <div class="active-f" id="activeF"></div>
+    <div class="scroll" id="listScroll">
+      <ul class="list" id="list"></ul>
+    </div>
+  </section>
+
+  <!-- ===== Right Workspace Tabs ===== -->
+  <section class="panel" id="sidePanel" aria-label="지도와 분석">
+    <div class="ph">
+      <div class="tabs" role="tablist">
+        <button role="tab" id="tabPro" aria-selected="true" data-v="pro">🏆 전문가</button>
+        <button role="tab" id="tabMap" aria-selected="false" data-v="map">🗺 지도</button>
+        <button role="tab" id="tabBuilders" aria-selected="false" data-v="builders">🏗 건설사(1.2만)</button>
+        <button role="tab" id="tabApi" aria-selected="false" data-v="api">🔌 API·업로드</button>
+        <button role="tab" id="tabCrm" aria-selected="false" data-v="crm">💼 파이프라인</button>
+      </div>
+    </div>
+
+    <div class="view on" id="vPro"><div class="scroll"><div class="pgrid" id="pro"></div></div></div>
+
+    <div class="view" id="vMap">
+      <div class="mapwrap precision-on" id="mapwrap">
+        <svg id="map" role="img" aria-label="시군구별 영업기회 지도"></svg>
+        <div class="sdbar" id="sdbar"></div>
+        <div class="mapmode" id="mapMode">
+          <button data-m="radar">🎯 조기포착 레이더</button>
+          <button data-m="precision" class="on">🗺 정밀지도</button>
+          <button data-m="opp">영업기회·입찰</button>
+          <button data-m="bld">건설사·시설(1.2만)</button>
+        </div>
+        <div id="vwMainMap" class="vw-main-wrap"></div>
+        <div id="radarMapBox" class="radar-wrap" hidden></div>
+        <div class="mapctl">
+          <button id="zin">+</button><button id="zout">−</button><button id="zreset" style="font-size:14px">⤢</button>
+        </div>
+        <div class="legend" id="legend"></div>
+        <div class="tip" id="tip"></div>
+      </div>
+    </div>
+
+    <div class="view" id="vBuilders"><div class="scroll"><div class="pgrid" id="builders"></div></div></div>
+    <div class="view" id="vApi"><div class="scroll"><div class="pgrid" id="apiPanel"></div></div></div>
+    <div class="view" id="vCrm"><div class="scroll"><div class="pgrid" id="crmPanel"></div></div></div>
+  </section>
+</main>
+
+<nav class="bnav" role="tablist">
+  <button data-v="list" aria-selected="true"><span class="i">☰</span>목록</button>
+  <button data-v="pro" aria-selected="false"><span class="i">🏆</span>전문가</button>
+  <button data-v="map" aria-selected="false"><span class="i">🗺</span>지도</button>
+  <button data-v="builders" aria-selected="false"><span class="i">🏗</span>건설사</button>
+  <button data-v="api" aria-selected="false"><span class="i">🔌</span>API</button>
+  <button data-v="crm" aria-selected="false"><span class="i">💼</span>CRM</button>
+</nav>
+</div>
+
+<div class="cmp-tray" id="cmpTray" hidden>
+  <span>⚖️ <b id="cmpCnt">0</b>/5</span>
+  <div class="cmp-names" id="cmpNames"></div>
+  <button class="go" id="cmpOpenBtn">비교하기</button>
+  <button class="clr" id="cmpClearBtn">비우기</button>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="detail" id="detail" aria-hidden="true">
+  <div class="grab"></div>
+  <div id="dbody" style="display:flex;flex-direction:column;min-height:0;flex:1"></div>
+</aside>
+
+<div class="modal wide" id="cmpModal" aria-hidden="true">
+  <div class="mhead">
+    <h3>⚖️ 입찰·영업기회 비교 매트릭스</h3>
+    <div style="display:flex;gap:6px"><button class="iconbtn sm" id="cmpCopyBtn">표 복사</button><button class="iconbtn sm" id="closeCmp">닫기</button></div>
+  </div>
+  <div id="cmpBody"></div>
+</div>
+
+<div class="modal" id="briefModal" aria-hidden="true">
+  <div class="mhead">
+    <h3>📄 1페이지 입찰·영업 브리핑</h3>
+    <div style="display:flex;gap:6px"><button class="iconbtn sm" id="briefCopyBtn" style="background:var(--accent);color:#fff;border-color:var(--accent)">복사</button><button class="iconbtn sm" id="closeBrief">닫기</button></div>
+  </div>
+  <div class="brief-pre" id="briefBody"></div>
+</div>
+
+<div class="modal" id="settingsModal" aria-hidden="true">
+  <div class="mhead"><h3>⚙️ 앱 설정</h3><button class="iconbtn sm" id="closeSettings">닫기</button></div>
+  <div class="mblock">
+    <div style="font-weight:700;font-size:13px;margin-bottom:6px">화면 테마</div>
+    <div class="chips" id="themeChips">
+      <button class="chip" data-th="auto">시스템 자동</button>
+      <button class="chip" data-th="light">라이트</button>
+      <button class="chip" data-th="dark">다크</button>
+    </div>
+  </div>
+  <div class="mblock">
+    <div style="font-weight:700;font-size:13px;margin-bottom:4px">🔑 공공데이터포털 일반 인증키 (로컬 전용)</div>
+    <p class="tiny" style="margin:0 0 6px">나라장터·K-apt·건축인허가 API 실시간 조회에 사용됩니다. 브라우저에만 저장됩니다.</p>
+    <div style="display:flex;gap:6px"><input class="inp" type="password" id="dataGoKeyIn" placeholder="공공데이터포털 인증키"><button class="iconbtn sm" id="saveDataGoKey" style="height:36px">저장</button></div>
+  </div>
+  <div class="mblock">
+    <div style="font-weight:700;font-size:13px;margin-bottom:4px">🗺 브이월드 디지털트윈국토 인증키 (현장 실사·지적·공시지가)</div>
+    <p class="tiny" style="margin:0 0 6px">Vault 암호화 번들에 기본 키가 안전하게 내장되어 있습니다. 새 키를 입력하면 이 브라우저에서 덮어씁니다.</p>
+    <div style="display:flex;gap:6px">
+      <input class="inp" type="password" id="vwKeyInSet" placeholder="브이월드 인증키 (비우면 Vault 기본 키 사용)">
+      <button class="iconbtn sm" id="vwEyeSet" style="height:36px" title="키 보기/숨기기">👁</button>
+      <button class="iconbtn sm" id="saveVwKeySet" style="height:36px">저장</button>
+    </div>
+    <div class="tiny" style="margin-top:4px">적용 키: <code id="vwMaskSet">확인 중…</code></div>
+  </div>
+  <div class="mblock">
+    <div style="font-weight:700;font-size:13px;margin-bottom:4px">✨ Gemini API 키 (AI 입찰·제안 전략 분석)</div>
+    <div style="display:flex;gap:6px"><input class="inp" type="password" id="geminiKeyIn" placeholder="AIza..."><button class="iconbtn sm" id="saveGeminiKey" style="height:36px">저장</button></div>
+  </div>
+  <div class="mblock">
+    <div style="font-weight:700;font-size:13px;margin-bottom:4px">💾 파이프라인·프리셋·수집데이터 백업</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="iconbtn sm" id="backupExport">백업 내려받기</button>
+      <label class="iconbtn sm" style="cursor:pointer">백업 불러오기<input type="file" id="backupImport" accept=".json" hidden></label>
+    </div>
+  </div>
+  <div class="mblock">
+    <div style="font-weight:700;font-size:13px;margin-bottom:6px">🔒 보안 및 캐시</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="iconbtn sm" id="modalLockBtn" style="color:var(--c8);border-color:var(--c8)">지금 잠금 (로그아웃)</button>
+      <button class="iconbtn sm" id="clearCacheBtn">오프라인 캐시 새로고침</button>
+    </div>
+    <p class="tiny" id="vaultInfo" style="margin:8px 0 0"></p>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="./vendor/leaflet.min.js"></script>
+<script src="./vworld.js"></script>
+<script src="./app.js?v=21"></script></script></script>
+</body>
+</html>

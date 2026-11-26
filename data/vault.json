@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "iter": 310000,
+  "salt": "W+Kq961llKiP0WSIoeQuRQ==",
+  "checkIv": "Lr6Xig6hodDaCbGz",
+  "checkCt": "FaHQrrUCSxyLwseLZMv0bJWrTMyADDSkZa276zIrF1HryQ==",
+  "builtAt": "2026-11-24",
+  "totalBytes": 939395,
+  "files": [
+    "map",
+    "meta",
+    "builders",
+    "opportunities"
+  ]
+}
